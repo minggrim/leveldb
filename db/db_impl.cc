@@ -222,9 +222,19 @@ void DBImpl::DeleteObsoleteFiles() {
     return;
   }
 
+  /*
+   * How does leveldb protect not to delete the files
+   * which are refered by snapshot or read iterator?
+   */
+
   // Make a set of all of the live files
+  // files are part of ongoing compaction
   std::set<uint64_t> live = pending_outputs_;
+
+  //
   versions_->AddLiveFiles(&live);
+
+  // live = pending_outputs_ + all version's 7-layers file (loop all versions)
 
   std::vector<std::string> filenames;
   env_->GetChildren(dbname_, &filenames); // Ignoring errors on purpose
@@ -259,6 +269,7 @@ void DBImpl::DeleteObsoleteFiles() {
       }
 
       if (!keep) {
+        // if we are going to delete this file, evict the table_cache either(index block cache)
         if (type == kTableFile) {
           table_cache_->Evict(number);
         }
@@ -708,6 +719,7 @@ void DBImpl::BackgroundCompaction() {
         (m->end ? m->end->DebugString().c_str() : "(end)"),
         (m->done ? "(end)" : manual_end.DebugString().c_str()));
   } else {
+    // get level i, Files(i), Files(i+1), overlapped Files(i+2)
     c = versions_->PickCompaction();
   }
 
@@ -715,12 +727,20 @@ void DBImpl::BackgroundCompaction() {
   if (c == NULL) {
     // Nothing to do
   } else if (!is_manual && c->IsTrivialMove()) {
+    /*
+     *  *--------*   input0.size() = 1
+     *               input1.size() = 0
+     *  *--------*   OverlappedSize(c->grandparent_) <= option limitation
+     */
     // Move file to next level
     assert(c->num_input_files(0) == 1);
     FileMetaData* f = c->input(0, 0);
+    // start build VersionEdit (Diff between new version and current_ version)
     c->edit()->DeleteFile(c->level(), f->number);
     c->edit()->AddFile(c->level() + 1, f->number, f->file_size,
                        f->smallest, f->largest);
+
+    // commit VersionEdit to Versions
     status = versions_->LogAndApply(c->edit(), &mutex_);
     if (!status.ok()) {
       RecordBackgroundError(status);
@@ -835,6 +855,7 @@ Status DBImpl::FinishCompactionOutputFile(CompactionState* compact,
 
   // Finish and check for file errors
   if (s.ok()) {
+    // Sync after complete building dbfile.
     s = compact->outfile->Sync();
   }
   if (s.ok()) {
@@ -873,14 +894,19 @@ Status DBImpl::InstallCompactionResults(CompactionState* compact) {
       static_cast<long long>(compact->total_bytes));
 
   // Add compaction outputs
+  // Install deleted {lv, filename} info from compaction structure into VersionEdit structure
   compact->compaction->AddInputDeletions(compact->compaction->edit());
   const int level = compact->compaction->level();
+
+  // Install added {lv, filename} info from compaction structure into VersionEdit structure
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     const CompactionState::Output& out = compact->outputs[i];
     compact->compaction->edit()->AddFile(
         level + 1,
         out.number, out.file_size, out.smallest, out.largest);
   }
+
+  // Do disk write to MANIFEST
   return versions_->LogAndApply(compact->compaction->edit(), &mutex_);
 }
 
@@ -897,6 +923,9 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == NULL);
   assert(compact->outfile == NULL);
+  // specify smallest snapshot number
+  // No snapshot : Last sequence
+  // Has snapshot : Oldest snapshot sequence number
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
@@ -908,11 +937,15 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
 
   Iterator* input = versions_->MakeInputIterator(compact->compaction);
   input->SeekToFirst();
+
+  //
   Status status;
   ParsedInternalKey ikey;
   std::string current_user_key;
   bool has_current_user_key = false;
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
+
+  // iterate InputIterator
   for (; input->Valid() && !shutting_down_.Acquire_Load(); ) {
     // Prioritize immutable compaction work
     if (has_imm_.NoBarrier_Load() != NULL) {
@@ -927,6 +960,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     }
 
     Slice key = input->key();
+
+    // stop condition
     if (compact->compaction->ShouldStopBefore(key) &&
         compact->builder != NULL) {
       status = FinishCompactionOutputFile(compact, input);
@@ -959,8 +994,8 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
                  ikey.sequence <= compact->smallest_snapshot &&
                  compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
         // For this user key:
-        // (1) there is no data in higher levels
-        // (2) data in lower levels will have larger sequence numbers
+        // (1) there is no data in higher levels                              // we are the base level of this key
+        // (2) data in lower levels will have larger sequence numbers         //
         // (3) data in layers that are being compacted here and have
         //     smaller sequence numbers will be dropped in the next
         //     few iterations of this loop (by rule (A) above).
@@ -1013,27 +1048,38 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   if (status.ok() && compact->builder != NULL) {
     status = FinishCompactionOutputFile(compact, input);
   }
+
+  // propagate iterating error
   if (status.ok()) {
     status = input->status();
   }
+
+  //
   delete input;
   input = NULL;
 
   CompactionStats stats;
   stats.micros = env_->NowMicros() - start_micros - imm_micros;
   for (int which = 0; which < 2; which++) {
+    // loop FileMeta::file_size of every file of level i and i+1 to record bytes_read
     for (int i = 0; i < compact->compaction->num_input_files(which); i++) {
       stats.bytes_read += compact->compaction->input(which, i)->file_size;
     }
   }
+
+  // loop FileMeta::file_size of every file of level i and i+1 to record bytes_read
   for (size_t i = 0; i < compact->outputs.size(); i++) {
     stats.bytes_written += compact->outputs[i].file_size;
   }
 
+  // hold lock before leaving this DoCompactionWork
   mutex_.Lock();
   stats_[compact->compaction->level() + 1].Add(stats);
 
   if (status.ok()) {
+    // dump in-memory VersionSet into MANIFEST file
+    // unlock during storage new/write MANIFEST file
+    // lock during memory structure manipulation
     status = InstallCompactionResults(compact);
   }
   if (!status.ok()) {

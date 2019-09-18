@@ -856,6 +856,7 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
       s = WriteSnapshot(descriptor_log_);
     }
   }
+  //-------------------------------------------end of lock scope mutex_ ------------------------------------------------
 
   // Unlock during expensive MANIFEST log write
   {
@@ -883,7 +884,8 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
     mu->Lock();
   }
 
-  // Install the new version
+  //-------------------------------------------start of lock scope mutex_ ------------------------------------------------
+  // Install the new version into in-memory structure
   if (s.ok()) {
     AppendVersion(v);
     log_number_ = edit->log_number_;
@@ -895,6 +897,8 @@ Status VersionSet::LogAndApply(VersionEdit* edit, port::Mutex* mu) {
       delete descriptor_file_;
       descriptor_log_ = NULL;
       descriptor_file_ = NULL;
+
+      /*THIS FILE DELETION IS UNDER LOCK SCOPE*/
       env_->DeleteFile(new_manifest_file);
     }
   }
@@ -1288,6 +1292,7 @@ Iterator* VersionSet::MakeInputIterator(Compaction* c) {
   return result;
 }
 
+// Decide what level to compact, and compact range at that level.
 Compaction* VersionSet::PickCompaction() {
   Compaction* c;
   int level;
@@ -1342,29 +1347,83 @@ Compaction* VersionSet::PickCompaction() {
   return c;
 }
 
+// use level i picked file range to find level i + 1
 void VersionSet::SetupOtherInputs(Compaction* c) {
   const int level = c->level();
   InternalKey smallest, largest;
+
+  // get choosed level i files range
   GetRange(c->inputs_[0], &smallest, &largest);
 
+  // use [smallest, largest] range to find level + 1 files.
   current_->GetOverlappingInputs(level+1, &smallest, &largest, &c->inputs_[1]);
 
   // Get entire range covered by compaction
   InternalKey all_start, all_limit;
+
+  // find [level i files] U [level i+1 files] range
   GetRange2(c->inputs_[0], c->inputs_[1], &all_start, &all_limit);
 
+  // *** This is optimization ***
   // See if we can grow the number of inputs in "level" without
   // changing the number of "level+1" files we pick up.
   if (!c->inputs_[1].empty()) {
     std::vector<FileMetaData*> expanded0;
+
+    // use [level i files] U [level i+1 files] range to find files in level i
     current_->GetOverlappingInputs(level, &all_start, &all_limit, &expanded0);
+
+    // Total file size choosen in level i
     const int64_t inputs0_size = TotalFileSize(c->inputs_[0]);
+    // Total file size choosen in level i + 1
     const int64_t inputs1_size = TotalFileSize(c->inputs_[1]);
+    // Total file size choosen using [level i files] U [level i+1 files] range
     const int64_t expanded0_size = TotalFileSize(expanded0);
-    if (expanded0.size() > c->inputs_[0].size() &&
-        inputs1_size + expanded0_size <
+
+
+    /*                                                                                             level i
+     *         Input0
+     *  *------------------*                                                                          (1)
+     *
+     *  *--------------------------------*   expanded0 = Files(i)( Range(Input0) U Range(Input1) )    (2)
+     *
+============================================================================================================
+     *                                                                                             level i+1
+     *                    Input1
+     *            *-------------------*                                                               (3)
+     *
+     *  *-------------------------------*    expanded1 = Files(i+1)( Range(expanded0) )               (4)
+     *
+============================================================================================================
+     *                                                                                             level i+2
+     *  *-------------------------------*    grandparents = Files(i+2)(all_start, all_limit)
+     *
+     *
+     * [smallest, largest]    = Range(Input0)                       // without opt
+     * [all_start, all_limit] = Range(Input0) U Range(Input1)       // without opt
+     * c->input1 = input1                                           // without opt
+     * c->input2 = input2                                           // without opt
+     *
+     *
+     * [smallest, largest]    = Range(expend0)                      // after opt
+     * [all_start, all_limit] = Range(expend0) U Range(expend1)     // after opt
+     * c->input1 = expend0                                          // after opt
+     * c->input2 = expend1                                          // after opt
+     *
+     *
+     * c->grandparents_ = Files(i+2)(all_start, all_limit)
+     *
+     *
+     *
+     */
+
+    // opt, expand as possible as we can but do not exceed option limitation
+    if (expanded0.size() > c->inputs_[0].size() &&        // (2) file count > (1) file count
+        inputs1_size + expanded0_size <                   // (3) + (2) file size total < option limitation
             ExpandedCompactionByteSizeLimit(options_)) {
       InternalKey new_start, new_limit;
+
+      // [new_start, new_limit] = Range(expanded0)
       GetRange(expanded0, &new_start, &new_limit);
       std::vector<FileMetaData*> expanded1;
       current_->GetOverlappingInputs(level+1, &new_start, &new_limit,
@@ -1388,6 +1447,8 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
     }
   }
 
+
+
   // Compute the set of grandparent files that overlap this compaction
   // (parent == level+1; grandparent == level+2)
   if (level + 2 < config::kNumLevels) {
@@ -1407,6 +1468,8 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
   // to be applied so that if the compaction fails, we will try a different
   // key range next time.
   compact_pointer_[level] = largest.Encode().ToString();
+
+  // set edit's level, and largest key
   c->edit_.SetCompactPointer(level, largest);
 }
 
@@ -1481,11 +1544,16 @@ void Compaction::AddInputDeletions(VersionEdit* edit) {
   }
 }
 
+// Is this level the base level of this key
 bool Compaction::IsBaseLevelForKey(const Slice& user_key) {
   // Maybe use binary search to find right entry instead of linear search?
   const Comparator* user_cmp = input_version_->vset_->icmp_.user_comparator();
+
+  // start from grandparent, end at level 6
   for (int lvl = level_ + 2; lvl < config::kNumLevels; lvl++) {
     const std::vector<FileMetaData*>& files = input_version_->files_[lvl];
+
+    // loop all file meta in this level
     for (; level_ptrs_[lvl] < files.size(); ) {
       FileMetaData* f = files[level_ptrs_[lvl]];
       if (user_cmp->Compare(user_key, f->largest.user_key()) <= 0) {
@@ -1506,6 +1574,8 @@ bool Compaction::ShouldStopBefore(const Slice& internal_key) {
   const VersionSet* vset = input_version_->vset_;
   // Scan to find earliest grandparent file that contains key.
   const InternalKeyComparator* icmp = &vset->icmp_;
+
+  //
   while (grandparent_index_ < grandparents_.size() &&
       icmp->Compare(internal_key,
                     grandparents_[grandparent_index_]->largest.Encode()) > 0) {
