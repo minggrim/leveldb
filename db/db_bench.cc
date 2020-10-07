@@ -5,6 +5,8 @@
 #include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sstream>
+#include <iomanip>
 #include "db/db_impl.h"
 #include "db/version_set.h"
 #include "leveldb/cache.h"
@@ -72,6 +74,9 @@ static int FLAGS_threads = 1;
 
 // Size of each value
 static int FLAGS_value_size = 100;
+
+// Size of each key
+static int FLAGS_key_size = 100;
 
 // Arrange to generate values that shrink to this fraction of
 // their original size after compression
@@ -321,24 +326,24 @@ class Benchmark {
   DB* db_;
   int num_;
   int value_size_;
+  int key_size_;
   int entries_per_batch_;
   WriteOptions write_options_;
   int reads_;
   int heap_counter_;
 
   void PrintHeader() {
-    const int kKeySize = 16;
     PrintEnvironment();
-    fprintf(stdout, "Keys:       %d bytes each\n", kKeySize);
+    fprintf(stdout, "Keys:       %d bytes each\n", FLAGS_key_size);
     fprintf(stdout, "Values:     %d bytes each (%d bytes after compression)\n",
             FLAGS_value_size,
             static_cast<int>(FLAGS_value_size * FLAGS_compression_ratio + 0.5));
     fprintf(stdout, "Entries:    %d\n", num_);
     fprintf(stdout, "RawSize:    %.1f MB (estimated)\n",
-            ((static_cast<int64_t>(kKeySize + FLAGS_value_size) * num_)
+            ((static_cast<int64_t>(FLAGS_key_size + FLAGS_value_size) * num_)
              / 1048576.0));
     fprintf(stdout, "FileSize:   %.1f MB (estimated)\n",
-            (((kKeySize + FLAGS_value_size * FLAGS_compression_ratio) * num_)
+            (((FLAGS_key_size + FLAGS_value_size * FLAGS_compression_ratio) * num_)
              / 1048576.0));
     PrintWarnings();
     fprintf(stdout, "------------------------------------------------\n");
@@ -409,6 +414,7 @@ class Benchmark {
     db_(NULL),
     num_(FLAGS_num),
     value_size_(FLAGS_value_size),
+    key_size_(FLAGS_key_size),
     entries_per_batch_(1),
     reads_(FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads),
     heap_counter_(0) {
@@ -450,6 +456,7 @@ class Benchmark {
       num_ = FLAGS_num;
       reads_ = (FLAGS_reads < 0 ? FLAGS_num : FLAGS_reads);
       value_size_ = FLAGS_value_size;
+      key_size_ = FLAGS_key_size;
       entries_per_batch_ = 1;
       write_options_ = WriteOptions();
 
@@ -756,10 +763,10 @@ class Benchmark {
       batch.Clear();
       for (int j = 0; j < entries_per_batch_; j++) {
         const int k = seq ? i+j : (thread->rand.Next() % FLAGS_num);
-        char key[100];
-        snprintf(key, sizeof(key), "%016d", k);
-        batch.Put(key, gen.Generate(value_size_));
-        bytes += value_size_ + strlen(key);
+        std::stringstream ss;
+        ss << std::setw(key_size_) << std::setfill('0') << k;
+        batch.Put(ss.str().c_str(), gen.Generate(value_size_));
+        bytes += value_size_ + ss.str().size();
         thread->stats.FinishedSingleOp();
       }
       s = db_->Write(write_options_, &batch);
@@ -802,10 +809,10 @@ class Benchmark {
     std::string value;
     int found = 0;
     for (int i = 0; i < reads_; i++) {
-      char key[100];
       const int k = thread->rand.Next() % FLAGS_num;
-      snprintf(key, sizeof(key), "%016d", k);
-      if (db_->Get(options, key, &value).ok()) {
+      std::stringstream ss;
+      ss << std::setw(key_size_) << std::setfill('0') << k;
+      if (db_->Get(options, ss.str().c_str(), &value).ok()) {
         found++;
       }
       thread->stats.FinishedSingleOp();
@@ -819,10 +826,10 @@ class Benchmark {
     ReadOptions options;
     std::string value;
     for (int i = 0; i < reads_; i++) {
-      char key[100];
       const int k = thread->rand.Next() % FLAGS_num;
-      snprintf(key, sizeof(key), "%016d.", k);
-      db_->Get(options, key, &value);
+      std::stringstream ss;
+      ss << std::setw(key_size_) << std::setfill('0') << k;
+      db_->Get(options, ss.str().c_str(), &value);
       thread->stats.FinishedSingleOp();
     }
   }
@@ -832,10 +839,10 @@ class Benchmark {
     std::string value;
     const int range = (FLAGS_num + 99) / 100;
     for (int i = 0; i < reads_; i++) {
-      char key[100];
       const int k = thread->rand.Next() % range;
-      snprintf(key, sizeof(key), "%016d", k);
-      db_->Get(options, key, &value);
+      std::stringstream ss;
+      ss << std::setw(key_size_) << std::setfill('0') << k;
+      db_->Get(options, ss.str().c_str(), &value);
       thread->stats.FinishedSingleOp();
     }
   }
@@ -845,11 +852,11 @@ class Benchmark {
     int found = 0;
     for (int i = 0; i < reads_; i++) {
       Iterator* iter = db_->NewIterator(options);
-      char key[100];
       const int k = thread->rand.Next() % FLAGS_num;
-      snprintf(key, sizeof(key), "%016d", k);
-      iter->Seek(key);
-      if (iter->Valid() && iter->key() == key) found++;
+      std::stringstream ss;
+      ss << std::setw(key_size_) << std::setfill('0') << k;
+      iter->Seek(ss.str().c_str());
+      if (iter->Valid() && iter->key() == ss.str().c_str()) found++;
       delete iter;
       thread->stats.FinishedSingleOp();
     }
@@ -866,9 +873,9 @@ class Benchmark {
       batch.Clear();
       for (int j = 0; j < entries_per_batch_; j++) {
         const int k = seq ? i+j : (thread->rand.Next() % FLAGS_num);
-        char key[100];
-        snprintf(key, sizeof(key), "%016d", k);
-        batch.Delete(key);
+        std::stringstream ss;
+        ss << std::setw(key_size_) << std::setfill('0') << k;
+        batch.Delete(ss.str().c_str());
         thread->stats.FinishedSingleOp();
       }
       s = db_->Write(write_options_, &batch);
@@ -903,9 +910,9 @@ class Benchmark {
         }
 
         const int k = thread->rand.Next() % FLAGS_num;
-        char key[100];
-        snprintf(key, sizeof(key), "%016d", k);
-        Status s = db_->Put(write_options_, key, gen.Generate(value_size_));
+        std::stringstream ss;
+        ss << std::setw(key_size_) << std::setfill('0') << k;
+        Status s = db_->Put(write_options_, ss.str().c_str(), gen.Generate(value_size_));
         if (!s.ok()) {
           fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           exit(1);
@@ -985,6 +992,8 @@ int main(int argc, char** argv) {
       FLAGS_threads = n;
     } else if (sscanf(argv[i], "--value_size=%d%c", &n, &junk) == 1) {
       FLAGS_value_size = n;
+    } else if (sscanf(argv[i], "--key_size=%d%c", &n, &junk) == 1) {
+      FLAGS_key_size = n;
     } else if (sscanf(argv[i], "--write_buffer_size=%d%c", &n, &junk) == 1) {
       FLAGS_write_buffer_size = n;
     } else if (sscanf(argv[i], "--max_file_size=%d%c", &n, &junk) == 1) {
